@@ -1,0 +1,21 @@
+# PyInstaller build
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Config & logs (chứa token, không commit)
+config.ini
+bot.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
