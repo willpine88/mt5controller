@@ -23,6 +23,7 @@ from pathlib import Path
 import win32gui
 import win32con
 import win32api
+import win32process
 import MetaTrader5 as mt5
 import pystray
 from PIL import Image, ImageDraw
@@ -192,23 +193,41 @@ def get_algo_state() -> bool | None:
     mt5.shutdown()
     return info.trade_allowed if info else None
 
+def _force_foreground(hwnd):
+    """Bring window to foreground, bypassing Windows restrictions."""
+    current_thread = win32api.GetCurrentThreadId()
+    target_thread = win32process.GetWindowThreadProcessId(hwnd)[0]
+    if current_thread != target_thread:
+        win32process.AttachThreadInput(current_thread, target_thread, True)
+    try:
+        if win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMINIMIZED:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.3)
+        win32gui.BringWindowToTop(hwnd)
+        win32gui.SetForegroundWindow(hwnd)
+    finally:
+        if current_thread != target_thread:
+            win32process.AttachThreadInput(current_thread, target_thread, False)
+
 def press_ctrl_e() -> tuple[bool, str]:
     hwnd = find_mt5_window()
     if not hwnd:
         return False, "❌ MT5 không tìm thấy — có thể chưa mở hoặc bị crash."
     try:
-        if win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMINIMIZED:
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            time.sleep(0.4)
-        win32gui.SetForegroundWindow(hwnd)
+        try:
+            _force_foreground(hwnd)
+        except Exception as e:
+            logger.warning("SetForegroundWindow failed (%s), sending keys anyway", e)
+            # Even if foreground fails, PostMessage can still work
         time.sleep(0.5)
-        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+        # Use PostMessage as fallback — works without foreground focus
+        win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_CONTROL, 0)
         time.sleep(0.05)
-        win32api.keybd_event(ord("E"), 0, 0, 0)
+        win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, ord("E"), 0)
         time.sleep(0.1)
-        win32api.keybd_event(ord("E"), 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32api.PostMessage(hwnd, win32con.WM_KEYUP, ord("E"), 0)
         time.sleep(0.05)
-        win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32api.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_CONTROL, 0)
         logger.info("Ctrl+E sent OK")
         return True, "OK"
     except Exception as e:
