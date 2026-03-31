@@ -1,13 +1,12 @@
 """
 MT5 Controller - WillPine
-MT5 Controller - WillPine
 ==========================================
 - Lần đầu chạy: form nhập config
 - Chạy xong: ẩn vào system tray
 - Tray menu: Start/Stop Bot, Edit Config, Exit
 
 Cài: python -m pip install python-telegram-bot pywin32 MetaTrader5 pystray Pillow pyinstaller
-Build exe: pyinstaller --onefile --noconsole tg.py
+Build exe: pyinstaller --onefile --noconsole --uac-admin --icon=icon.ico --name=MT5Controller mt5control.py
 """
 
 import os
@@ -20,6 +19,8 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 
+import ctypes
+import ctypes.wintypes
 import win32gui
 import win32con
 import win32api
@@ -175,6 +176,44 @@ def show_config_dialog(on_save=None):
 
 
 # ============================================================
+#  WIN32 SENDINPUT STRUCTS (must match Windows SDK layout)
+# ============================================================
+INPUT_KEYBOARD     = 1
+KEYEVENTF_KEYUP    = 0x0002
+SCAN_CTRL          = 0x1D
+SCAN_E             = 0x12
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx",          ctypes.c_long),
+                ("dy",          ctypes.c_long),
+                ("mouseData",   ctypes.wintypes.DWORD),
+                ("dwFlags",     ctypes.wintypes.DWORD),
+                ("time",        ctypes.wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk",         ctypes.wintypes.WORD),
+                ("wScan",       ctypes.wintypes.WORD),
+                ("dwFlags",     ctypes.wintypes.DWORD),
+                ("time",        ctypes.wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg",    ctypes.wintypes.DWORD),
+                ("wParamL", ctypes.wintypes.WORD),
+                ("wParamH", ctypes.wintypes.WORD)]
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT),
+                ("ki", KEYBDINPUT),
+                ("hi", HARDWAREINPUT)]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type",   ctypes.wintypes.DWORD),
+                ("_input", _INPUT_UNION)]
+
+
+# ============================================================
 #  MT5 AUTOMATION
 # ============================================================
 def find_mt5_window() -> int | None:
@@ -194,45 +233,120 @@ def get_algo_state() -> bool | None:
     return info.trade_allowed if info else None
 
 def _force_foreground(hwnd):
-    """Bring window to foreground, bypassing Windows restrictions."""
+    """Bring window to foreground, bypassing Windows VPS restrictions."""
+    user32 = ctypes.windll.user32
+    SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+    user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, 0x0002)
+
     current_thread = win32api.GetCurrentThreadId()
-    target_thread = win32process.GetWindowThreadProcessId(hwnd)[0]
+    target_thread  = win32process.GetWindowThreadProcessId(hwnd)[0]
+    attached = False
     if current_thread != target_thread:
         win32process.AttachThreadInput(current_thread, target_thread, True)
+        attached = True
     try:
-        if win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMINIMIZED:
+        if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             time.sleep(0.3)
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
         win32gui.BringWindowToTop(hwnd)
         win32gui.SetForegroundWindow(hwnd)
     finally:
-        if current_thread != target_thread:
+        if attached:
             win32process.AttachThreadInput(current_thread, target_thread, False)
 
-def press_ctrl_e() -> tuple[bool, str]:
+def _send_input_ctrl_e() -> bool:
+    """Simulate Ctrl+E via SendInput with correct struct layout."""
+    def make_key(vk, scan, flags=0):
+        inp = INPUT()
+        inp.type = INPUT_KEYBOARD
+        inp._input.ki.wVk    = vk
+        inp._input.ki.wScan  = scan
+        inp._input.ki.dwFlags = flags
+        return inp
+
+    inputs = (INPUT * 4)(
+        make_key(win32con.VK_CONTROL, SCAN_CTRL, 0),
+        make_key(ord("E"),            SCAN_E,    0),
+        make_key(ord("E"),            SCAN_E,    KEYEVENTF_KEYUP),
+        make_key(win32con.VK_CONTROL, SCAN_CTRL, KEYEVENTF_KEYUP),
+    )
+    size = ctypes.sizeof(INPUT)
+    n_sent = ctypes.windll.user32.SendInput(4, ctypes.pointer(inputs[0]), size)
+    logger.info("SendInput: %d/4 events sent (sizeof(INPUT)=%d)", n_sent, size)
+    return n_sent == 4
+
+_algo_cmd_id: int | None = None
+
+def _find_algo_command_id(hwnd) -> int | None:
+    """Walk MT5 menu bar to find the Algo Trading command ID."""
+    global _algo_cmd_id
+    if _algo_cmd_id is not None:
+        return _algo_cmd_id
+    try:
+        menu_bar = win32gui.GetMenu(hwnd)
+        if not menu_bar:
+            logger.warning("WM_COMMAND: no menu bar found")
+            return None
+        for i in range(win32gui.GetMenuItemCount(menu_bar)):
+            submenu = win32gui.GetSubMenu(menu_bar, i)
+            if not submenu:
+                continue
+            for j in range(win32gui.GetMenuItemCount(submenu)):
+                try:
+                    text = win32gui.GetMenuString(submenu, j, win32con.MF_BYPOSITION)
+                except Exception:
+                    continue
+                if "Algo" in text or "algo" in text:
+                    cmd_id = win32gui.GetMenuItemID(submenu, j)
+                    if cmd_id > 0:
+                        _algo_cmd_id = cmd_id
+                        logger.info("WM_COMMAND: found Algo Trading menu item, cmd_id=%d", cmd_id)
+                        return cmd_id
+        logger.warning("WM_COMMAND: Algo Trading menu item not found")
+    except Exception as e:
+        logger.warning("WM_COMMAND: menu scan failed: %s", e)
+    return None
+
+def _send_wm_command_toggle(hwnd) -> bool:
+    """Toggle Algo Trading via WM_COMMAND (no foreground needed)."""
+    cmd_id = _find_algo_command_id(hwnd)
+    if cmd_id is None:
+        return False
+    win32api.PostMessage(hwnd, win32con.WM_COMMAND, cmd_id, 0)
+    logger.info("WM_COMMAND sent with cmd_id=%d", cmd_id)
+    return True
+
+def toggle_algo_trading() -> tuple[bool, str]:
+    """Try to toggle Algo Trading: SendInput first, then WM_COMMAND fallback."""
     hwnd = find_mt5_window()
     if not hwnd:
         return False, "❌ MT5 không tìm thấy — có thể chưa mở hoặc bị crash."
     try:
+        # Method 1: Foreground + SendInput
         try:
             _force_foreground(hwnd)
         except Exception as e:
-            logger.warning("SetForegroundWindow failed (%s), sending keys anyway", e)
-            # Even if foreground fails, PostMessage can still work
+            logger.warning("SetForegroundWindow failed: %s", e)
         time.sleep(0.5)
-        # Use PostMessage as fallback — works without foreground focus
-        win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_CONTROL, 0)
-        time.sleep(0.05)
-        win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, ord("E"), 0)
-        time.sleep(0.1)
-        win32api.PostMessage(hwnd, win32con.WM_KEYUP, ord("E"), 0)
-        time.sleep(0.05)
-        win32api.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_CONTROL, 0)
-        logger.info("Ctrl+E sent OK")
-        return True, "OK"
+
+        fg = win32gui.GetForegroundWindow()
+        logger.info("Foreground hwnd=%s, MT5 hwnd=%s, match=%s", fg, hwnd, fg == hwnd)
+
+        if _send_input_ctrl_e():
+            return True, "OK"
+
+        # Method 2: WM_COMMAND — send menu command directly (no foreground needed)
+        logger.warning("SendInput failed, trying WM_COMMAND fallback")
+        if _send_wm_command_toggle(hwnd):
+            return True, "OK"
+
+        return False, "❌ Không thể gửi Ctrl+E — kiểm tra quyền admin."
     except Exception as e:
-        logger.error("press_ctrl_e: %s", e)
+        logger.error("toggle_algo_trading: %s", e)
         return False, f"❌ Lỗi: {e}"
+
+MAX_TOGGLE_RETRIES = 3
 
 def set_algo(target: bool) -> tuple[bool, str, bool | None]:
     current = get_algo_state()
@@ -240,16 +354,19 @@ def set_algo(target: bool) -> tuple[bool, str, bool | None]:
         return False, "❌ MT5 không phản hồi.", None
     if current == target:
         return True, "already", current
-    ok, err = press_ctrl_e()
-    if not ok:
-        return False, err, current
-    time.sleep(1.0)
-    new_state = get_algo_state()
-    if new_state is None:
-        return False, "❌ Không đọc được state sau toggle.", None
-    if new_state != target:
-        return False, "⚠️ Toggle xong nhưng state không đổi — thử lại.", new_state
-    return True, "ok", new_state
+    for attempt in range(1, MAX_TOGGLE_RETRIES + 1):
+        ok, err = toggle_algo_trading()
+        if not ok:
+            return False, err, current
+        time.sleep(1.5)
+        new_state = get_algo_state()
+        if new_state is None:
+            return False, "❌ Không đọc được state sau toggle.", None
+        if new_state == target:
+            return True, "ok", new_state
+        logger.warning("Toggle attempt %d/%d failed, state unchanged", attempt, MAX_TOGGLE_RETRIES)
+        time.sleep(0.5)
+    return False, "⚠️ Toggle không thành công sau nhiều lần thử — kiểm tra MT5.", new_state
 
 
 # ============================================================
