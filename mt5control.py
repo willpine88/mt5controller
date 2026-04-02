@@ -12,10 +12,14 @@ Build exe: pyinstaller --onefile --noconsole --uac-admin --icon=icon.ico --name=
 import os
 import sys
 import time
+import subprocess
+import webbrowser
 import threading
 import logging
 import configparser
 import asyncio
+import json
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +36,70 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import tkinter as tk
 from tkinter import messagebox
+
+# ============================================================
+#  VERSION & UPDATE
+# ============================================================
+VERSION      = "1.6.0"
+GITHUB_REPO  = "willpine88/mt5controller"
+RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """Convert '1.5.0' → (1, 5, 0) for comparison."""
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return (0,)
+
+def check_for_update() -> tuple[str, str] | None:
+    """Return (new_version, exe_download_url) or None if up-to-date."""
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        latest = data.get("tag_name", "").lstrip("v")
+        if not latest or _version_tuple(latest) <= _version_tuple(VERSION):
+            return None
+        for asset in data.get("assets", []):
+            if asset["name"].lower().endswith(".exe"):
+                return latest, asset["browser_download_url"]
+        return latest, ""
+    except Exception as e:
+        logger.debug("Update check failed: %s", e)
+    return None
+
+_pending_update_path: Path | None = None
+
+def download_update(download_url: str) -> bool:
+    """Download new exe. Returns True if ready to apply on exit."""
+    global _pending_update_path
+    exe_path    = Path(sys.executable)
+    update_path = exe_path.parent / "MT5Controller_update.exe"
+
+    logger.info("Downloading update from %s", download_url)
+    urllib.request.urlretrieve(download_url, str(update_path))
+    logger.info("Downloaded to %s (%d bytes)", update_path, update_path.stat().st_size)
+    _pending_update_path = update_path
+    return True
+
+def apply_pending_update():
+    """If an update was downloaded, run batch to swap files after app exits."""
+    if _pending_update_path is None or not _pending_update_path.exists():
+        return
+    exe_path   = Path(sys.executable)
+    batch_path = exe_path.parent / "_update.bat"
+
+    batch = f'''@echo off
+ping 127.0.0.1 -n 3 >nul
+del "{exe_path}"
+move "{_pending_update_path}" "{exe_path}"
+del "%~f0"
+'''
+    batch_path.write_text(batch, encoding="utf-8")
+    subprocess.Popen(["cmd", "/c", str(batch_path)], creationflags=0x08000000)
+    logger.info("Update batch launched, swapping files after exit")
+
 
 # ============================================================
 #  PATHS
@@ -234,6 +302,10 @@ def get_algo_state() -> bool | None:
 
 def _force_foreground(hwnd):
     """Bring window to foreground, bypassing Windows VPS restrictions."""
+    # Skip if already foreground
+    if win32gui.GetForegroundWindow() == hwnd:
+        return
+
     user32 = ctypes.windll.user32
     SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
     user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, 0x0002)
@@ -248,7 +320,6 @@ def _force_foreground(hwnd):
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             time.sleep(0.3)
-        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
         win32gui.BringWindowToTop(hwnd)
         win32gui.SetForegroundWindow(hwnd)
     finally:
@@ -538,6 +609,20 @@ def make_icon() -> Image.Image:
     draw.text((16, 20), "M5", fill="white")
     return img
 
+def _do_update_check(icon, silent=True):
+    """Background update check — notify via tray if new version found."""
+    result = check_for_update()
+    if result is None:
+        logger.info("Update check: running latest v%s", VERSION)
+        if not silent:
+            icon.notify(f"Đang dùng bản mới nhất v{VERSION}.", "MT5 Controller")
+        return
+    new_ver, dl_url = result
+    logger.info("Update available: v%s → v%s", VERSION, new_ver)
+    icon._update_ver = new_ver
+    icon._update_url = dl_url
+    icon.notify(f"Có phiên bản mới v{new_ver}! Click 'Update' để tải.", "MT5 Controller")
+
 def run_tray():
     def on_start(icon, item):
         if not _bot_running:
@@ -553,24 +638,44 @@ def run_tray():
         stop_bot()
         show_config_dialog(on_save=start_bot)
 
+    def on_update(icon, item):
+        dl_url = getattr(icon, "_update_url", "")
+        new_ver = getattr(icon, "_update_ver", "")
+        if dl_url:
+            icon.notify(f"Đang tải v{new_ver}...", "MT5 Controller")
+            try:
+                download_update(dl_url)
+                icon.notify(f"Đã tải v{new_ver}. Chọn Exit để cập nhật.", "MT5 Controller")
+            except Exception as e:
+                logger.error("Update failed: %s", e)
+                icon.notify(f"Cập nhật thất bại: {e}", "MT5 Controller")
+        else:
+            threading.Thread(target=_do_update_check, args=(icon,), daemon=True).start()
+
     def on_exit(icon, item):
         stop_bot()
+        apply_pending_update()
         icon.stop()
         os._exit(0)
 
     icon = pystray.Icon(
         name="MT5Bot",
         icon=make_icon(),
-        title="MT5 Controller - WillPine",
+        title=f"MT5 Controller v{VERSION}",
         menu=pystray.Menu(
             pystray.MenuItem("▶  Start Bot",    on_start),
             pystray.MenuItem("⏹  Stop Bot",     on_stop),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("⚙  Edit Config",  on_edit),
+            pystray.MenuItem("⬆  Check Update", on_update),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("✕  Exit",         on_exit),
         )
     )
+
+    # Auto-check on startup (background)
+    threading.Thread(target=_do_update_check, args=(icon,), daemon=True).start()
+
     icon.run()
 
 
