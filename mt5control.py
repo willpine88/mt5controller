@@ -347,18 +347,19 @@ def _send_input_ctrl_e() -> bool:
     logger.info("SendInput: %d/4 events sent (sizeof(INPUT)=%d)", n_sent, size)
     return n_sent == 4
 
+MT5_WMCMD_EXPERTS = 32851  # Known constant for Algo Trading toggle across all MT5 builds
 _algo_cmd_id: int | None = None
 
 def _find_algo_command_id(hwnd) -> int | None:
-    """Walk MT5 menu bar to find the Algo Trading command ID."""
+    """Walk MT5 menu bar to find the Algo Trading command ID, fallback to known constant."""
     global _algo_cmd_id
     if _algo_cmd_id is not None:
         return _algo_cmd_id
     try:
         menu_bar = win32gui.GetMenu(hwnd)
         if not menu_bar:
-            logger.warning("WM_COMMAND: no menu bar found")
-            return None
+            logger.warning("WM_COMMAND: no menu bar found, using hardcoded constant %d", MT5_WMCMD_EXPERTS)
+            return MT5_WMCMD_EXPERTS
         for i in range(win32gui.GetMenuItemCount(menu_bar)):
             submenu = win32gui.GetSubMenu(menu_bar, i)
             if not submenu:
@@ -374,10 +375,11 @@ def _find_algo_command_id(hwnd) -> int | None:
                         _algo_cmd_id = cmd_id
                         logger.info("WM_COMMAND: found Algo Trading menu item, cmd_id=%d", cmd_id)
                         return cmd_id
-        logger.warning("WM_COMMAND: Algo Trading menu item not found")
+        logger.warning("WM_COMMAND: menu scan failed, using hardcoded constant %d", MT5_WMCMD_EXPERTS)
     except Exception as e:
-        logger.warning("WM_COMMAND: menu scan failed: %s", e)
-    return None
+        logger.warning("WM_COMMAND: menu scan error: %s, using hardcoded constant %d", e, MT5_WMCMD_EXPERTS)
+    _algo_cmd_id = MT5_WMCMD_EXPERTS
+    return MT5_WMCMD_EXPERTS
 
 def _send_wm_command_toggle(hwnd) -> bool:
     """Toggle Algo Trading via WM_COMMAND (no foreground needed)."""
@@ -389,12 +391,17 @@ def _send_wm_command_toggle(hwnd) -> bool:
     return True
 
 def toggle_algo_trading() -> tuple[bool, str]:
-    """Try to toggle Algo Trading: SendInput first, then WM_COMMAND fallback."""
+    """Try to toggle Algo Trading: WM_COMMAND first (no foreground needed), SendInput fallback."""
     hwnd = find_mt5_window()
     if not hwnd:
         return False, "❌ MT5 không tìm thấy — có thể chưa mở hoặc bị crash."
     try:
-        # Method 1: Foreground + SendInput
+        # Method 1: WM_COMMAND — works without foreground, reliable on VPS
+        if _send_wm_command_toggle(hwnd):
+            return True, "OK"
+
+        # Method 2: Foreground + SendInput (fallback, requires interactive session)
+        logger.warning("WM_COMMAND failed, trying SendInput fallback")
         try:
             _force_foreground(hwnd)
         except Exception as e:
@@ -407,12 +414,7 @@ def toggle_algo_trading() -> tuple[bool, str]:
         if _send_input_ctrl_e():
             return True, "OK"
 
-        # Method 2: WM_COMMAND — send menu command directly (no foreground needed)
-        logger.warning("SendInput failed, trying WM_COMMAND fallback")
-        if _send_wm_command_toggle(hwnd):
-            return True, "OK"
-
-        return False, "❌ Không thể gửi Ctrl+E — kiểm tra quyền admin."
+        return False, "❌ Không thể toggle Algo — kiểm tra quyền admin."
     except Exception as e:
         logger.error("toggle_algo_trading: %s", e)
         return False, f"❌ Lỗi: {e}"
@@ -680,9 +682,25 @@ def run_tray():
 
 
 # ============================================================
+#  KEEP-ALIVE: prevent Windows from sleeping/killing the process on VPS
+# ============================================================
+def _prevent_idle_shutdown():
+    """Call SetThreadExecutionState to prevent Windows idle sleep/display-off."""
+    ES_CONTINUOUS      = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+    ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+    )
+    logger.info("SetThreadExecutionState: idle sleep prevention enabled")
+
+
+# ============================================================
 #  ENTRY POINT
 # ============================================================
 if __name__ == "__main__":
+    _prevent_idle_shutdown()
+
     if not config_complete():
         # Lần đầu chạy: hiện form config trước
         show_config_dialog(on_save=start_bot)
