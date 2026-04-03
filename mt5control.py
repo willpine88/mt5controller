@@ -19,7 +19,9 @@ import logging
 import configparser
 import asyncio
 import json
+import ssl
 import urllib.request
+import certifi
 from datetime import datetime
 from pathlib import Path
 
@@ -40,7 +42,7 @@ from tkinter import messagebox
 # ============================================================
 #  VERSION & UPDATE
 # ============================================================
-VERSION      = "1.6.0"
+VERSION      = "1.7.0"
 GITHUB_REPO  = "willpine88/mt5controller"
 RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
 
@@ -56,7 +58,8 @@ def check_for_update() -> tuple[str, str] | None:
     try:
         url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
             data = json.loads(resp.read())
         latest = data.get("tag_name", "").lstrip("v")
         if not latest or _version_tuple(latest) <= _version_tuple(VERSION):
@@ -78,7 +81,10 @@ def download_update(download_url: str) -> bool:
     update_path = exe_path.parent / "MT5Controller_update.exe"
 
     logger.info("Downloading update from %s", download_url)
-    urllib.request.urlretrieve(download_url, str(update_path))
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    req = urllib.request.Request(download_url)
+    with urllib.request.urlopen(req, context=ctx) as resp, open(update_path, "wb") as f:
+        f.write(resp.read())
     logger.info("Downloaded to %s (%d bytes)", update_path, update_path.stat().st_size)
     _pending_update_path = update_path
     return True
