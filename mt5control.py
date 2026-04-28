@@ -42,7 +42,7 @@ from tkinter import messagebox
 # ============================================================
 #  VERSION & UPDATE
 # ============================================================
-VERSION      = "1.7.0"
+VERSION      = "1.8.0"
 GITHUB_REPO  = "willpine88/mt5controller"
 RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
 
@@ -297,10 +297,34 @@ def find_mt5_window() -> int | None:
         if win32gui.IsWindowVisible(hwnd) and keyword in win32gui.GetWindowText(hwnd):
             found.append(hwnd)
     win32gui.EnumWindows(cb, None)
+    if len(found) > 1:
+        titles = [win32gui.GetWindowText(h) for h in found]
+        logger.info("Multiple MT5 windows matched (%d): %s — using first", len(found), titles)
     return found[0] if found else None
 
-def get_algo_state() -> bool | None:
-    if not mt5.initialize():
+def _get_window_exe_path(hwnd) -> str | None:
+    """Return absolute exe path of process owning hwnd (None on failure)."""
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h_proc = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h_proc:
+            return None
+        try:
+            buf_len = ctypes.wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(buf_len.value)
+            if ctypes.windll.kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(buf_len)):
+                return buf.value
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h_proc)
+    except Exception as e:
+        logger.warning("Failed to get exe path for hwnd=%s: %s", hwnd, e)
+    return None
+
+def get_algo_state(path: str | None = None) -> bool | None:
+    """Read trade_allowed flag. Pass path to pin to specific terminal when multiple MT5 are open."""
+    init_ok = mt5.initialize(path=path) if path else mt5.initialize()
+    if not init_ok:
         return None
     info = mt5.terminal_info()
     mt5.shutdown()
@@ -428,17 +452,23 @@ def toggle_algo_trading() -> tuple[bool, str]:
 MAX_TOGGLE_RETRIES = 3
 
 def set_algo(target: bool) -> tuple[bool, str, bool | None]:
-    current = get_algo_state()
+    hwnd = find_mt5_window()
+    if not hwnd:
+        return False, "❌ MT5 không tìm thấy — có thể chưa mở hoặc bị crash.", None
+    exe_path = _get_window_exe_path(hwnd)
+    logger.info("set_algo: pinned to hwnd=%s exe=%s", hwnd, exe_path)
+    current = get_algo_state(exe_path)
     if current is None:
         return False, "❌ MT5 không phản hồi.", None
     if current == target:
         return True, "already", current
+    new_state = current
     for attempt in range(1, MAX_TOGGLE_RETRIES + 1):
         ok, err = toggle_algo_trading()
         if not ok:
             return False, err, current
         time.sleep(1.5)
-        new_state = get_algo_state()
+        new_state = get_algo_state(exe_path)
         if new_state is None:
             return False, "❌ Không đọc được state sau toggle.", None
         if new_state == target:
@@ -540,8 +570,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_for_me(update): return
     if not is_allowed(update): return
     cfg      = get_cfg()
-    state    = get_algo_state()
     mt5_win  = find_mt5_window()
+    state    = get_algo_state(_get_window_exe_path(mt5_win)) if mt5_win else None
     mt5_str  = "✅ Đang chạy" if mt5_win else "❌ Không tìm thấy"
     algo_str = "✅ BẬT" if state else ("⛔ TẮT" if state is not None else "❓ Không xác định")
     await update.message.reply_text(
