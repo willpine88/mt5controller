@@ -42,7 +42,7 @@ from tkinter import messagebox
 # ============================================================
 #  VERSION & UPDATE
 # ============================================================
-VERSION      = "1.8.0"
+VERSION      = "1.8.1"
 GITHUB_REPO  = "willpine88/mt5controller"
 RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
 

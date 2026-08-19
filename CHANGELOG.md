@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.1] - 2026-08-19
+### Fixed
+- Drop the unused Pillow AVIF codec (`PIL._avif`, 7.8 MB) from the bundle. It was the largest single payload in the onefile archive and the entry reported in "Failed to extract PIL\_avif...: decompression resulted in return code -1". Only `Image.new`/`ImageDraw` are used (tray icon drawn in memory), so no image codec is needed.
+- Disable UPX packing in the spec — it rewrites bundled binaries and is a common source of corrupt payloads and AV false positives.
+- Build shrinks 37.9 MB → 33.8 MB, reducing transfer-corruption risk when copying to a VPS.
+
 ## [1.8.0] - 2026-04-28
 ### Fixed
 - Pin `mt5.initialize()` to the same MT5 terminal targeted by `find_mt5_window()` via process exe path. Resolves "Toggle attempt failed, state unchanged" when 2+ MT5 windows are open (state was being read from the wrong terminal).
